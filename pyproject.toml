@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ja3-proxy"
+version = "0.1.0"
+description = "TLS-impersonating MITM proxy with an MCP control plane — presents a real browser JA3/JA4 + HTTP-2 fingerprint upstream of Burp."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+keywords = ["mitmproxy", "curl_cffi", "ja3", "ja4", "tls-fingerprint", "mcp", "burp"]
+dependencies = [
+    "mitmproxy>=11.0.0",
+    "curl_cffi>=0.7.0",
+    "mcp>=1.2.0",
+    "uvicorn>=0.30.0",
+    "starlette>=0.37.0",
+]
+
+[project.scripts]
+ja3proxy = "ja3proxy.__main__:main"
+
+[tool.setuptools]
+packages = ["ja3proxy"]

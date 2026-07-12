@@ -1,0 +1,26 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python caches / build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# mitmproxy CA / state (generated at runtime; never commit private keys)
+.mitmproxy/
+*.pem
+
+# Local scratch / logs
+*.log
+scratch/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

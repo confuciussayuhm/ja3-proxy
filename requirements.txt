@@ -1,0 +1,7 @@
+# JA3 impersonating upstream proxy — runtime dependencies.
+# Installed on the host running the proxy. Python 3.11+.
+mitmproxy>=11.0.0
+curl_cffi>=0.7.0
+mcp>=1.2.0
+uvicorn>=0.30.0
+starlette>=0.37.0
