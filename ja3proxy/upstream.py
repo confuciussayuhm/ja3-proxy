@@ -5,6 +5,9 @@ mitmproxy terminates the TLS Burp speaks to us (using its own CA — Burp accept
 mitmproxy's own vanilla-TLS upstream by performing the real upstream fetch with curl_cffi
 (`impersonate=<profile>`), which presents a genuine browser JA3/JA4 + HTTP-2 fingerprint to
 the target, then set `flow.response` from the result.
+
+The upstream leg is routed through the UpstreamPool: an upstream proxy is chosen per host
+(sticky), with connection-failure failover and block-aware rotation.
 """
 
 from __future__ import annotations
@@ -14,7 +17,7 @@ import asyncio
 from curl_cffi import requests as cffi
 from mitmproxy import http
 
-from .state import EgressRecord, ProfileStore
+from .state import DIRECT_NAME, EgressRecord, ProfileStore, UpstreamPool
 
 # Headers we must not forward verbatim to the upstream client: hop-by-hop, or values
 # curl_cffi will recompute. Content-Encoding/Content-Length on the RESPONSE are also
@@ -34,12 +37,19 @@ _STRIP_RESPONSE_HEADERS = {
     "connection",
 }
 
+# Response codes we treat as the target blocking this egress IP (drives block-aware rotation).
+_BLOCK_STATUS = {403, 429}
+
+# Max upstreams to try on connection failure within a single request.
+_MAX_FAILOVER = 4
+
 
 class ImpersonateUpstream:
-    """Delegates the upstream leg of every proxied request to curl_cffi."""
+    """Delegates the upstream leg of every proxied request to curl_cffi, via the pool."""
 
-    def __init__(self, store: ProfileStore, *, verify_upstream: bool = True) -> None:
+    def __init__(self, store: ProfileStore, pool: UpstreamPool, *, verify_upstream: bool = True) -> None:
         self._store = store
+        self._pool = pool
         self._verify_upstream = verify_upstream
 
     async def request(self, flow: http.HTTPFlow) -> None:
@@ -49,7 +59,6 @@ class ImpersonateUpstream:
 
         host = flow.request.pretty_host
         profile = self._store.resolve(host)
-        chain = self._store.snapshot().get("upstream_chain")
 
         req_headers = [
             (name, value)
@@ -58,18 +67,18 @@ class ImpersonateUpstream:
         ]
 
         try:
-            resp = await asyncio.to_thread(
-                self._fetch,
+            resp, used = await asyncio.to_thread(
+                self._fetch_with_pool,
                 flow.request.method,
                 flow.request.url,
+                host,
                 req_headers,
                 flow.request.raw_content or b"",
                 profile,
-                chain,
             )
         except Exception as exc:  # noqa: BLE001 — surface any upstream failure as a 502
             self._store.record(
-                EgressRecord(host, flow.request.method, flow.request.path, profile, None, str(exc))
+                EgressRecord(host, flow.request.method, flow.request.path, profile, "-", None, str(exc))
             )
             flow.response = http.Response.make(
                 502,
@@ -86,31 +95,63 @@ class ImpersonateUpstream:
             if name.lower() not in _STRIP_RESPONSE_HEADERS
         ]
         resp_headers.append((b"x-ja3-proxy-profile", profile.encode("ascii", "replace")))
+        resp_headers.append((b"x-ja3-proxy-upstream", used.encode("ascii", "replace")))
 
         flow.response = http.Response.make(resp.status_code, resp.content, resp_headers)
         self._store.record(
-            EgressRecord(host, flow.request.method, flow.request.path, profile, resp.status_code)
+            EgressRecord(host, flow.request.method, flow.request.path, profile, used, resp.status_code)
         )
 
-    def _fetch(
+    def _fetch_with_pool(
         self,
         method: str,
         url: str,
+        host: str,
         headers: list[tuple[str, str]],
         body: bytes,
         profile: str,
-        chain: str | None,
-    ) -> cffi.Response:
-        """Blocking curl_cffi call, run in a worker thread so the proxy loop stays free."""
-        proxies = {"http": chain, "https": chain} if chain else None
-        return cffi.request(
-            method,
-            url,
-            headers=headers,
-            data=body if body else None,
-            impersonate=profile,
-            allow_redirects=False,
-            verify=self._verify_upstream,
-            proxies=proxies,
-            timeout=120,
-        )
+    ) -> tuple[cffi.Response, str]:
+        """Blocking curl_cffi call with pool selection + connection-failure failover.
+
+        Runs in a worker thread so the proxy loop stays free. Returns (response, upstream_name).
+        A 403/429 is fed back as a block signal (rotates the host next time) but is returned
+        as-is — only connection errors trigger same-request failover.
+        """
+        tried: set[str] = set()
+        last_exc: Exception | None = None
+
+        for _ in range(_MAX_FAILOVER):
+            upstream = self._pool.select(host, exclude=tried)
+            name = upstream.name if upstream is not None else DIRECT_NAME
+            proxies = upstream.proxies() if upstream is not None else None
+
+            try:
+                resp = cffi.request(
+                    method,
+                    url,
+                    headers=headers,
+                    data=body if body else None,
+                    impersonate=profile,
+                    allow_redirects=False,
+                    verify=self._verify_upstream,
+                    proxies=proxies,
+                    timeout=120,
+                )
+            except Exception as exc:  # noqa: BLE001 — connection error: bench + failover
+                last_exc = exc
+                self._pool.record_result(host, name, ok=False)
+                tried.add(name)
+                # If the only remaining option is direct and we've tried it, stop.
+                if name == DIRECT_NAME and proxies is None and name in tried and self._pool_exhausted(tried):
+                    break
+                continue
+
+            blocked = resp.status_code in _BLOCK_STATUS
+            self._pool.record_result(host, name, ok=True, blocked=blocked)
+            return resp, name
+
+        raise last_exc if last_exc is not None else RuntimeError("no upstream available")
+
+    def _pool_exhausted(self, tried: set[str]) -> bool:
+        names = {u["name"] for u in self._pool.snapshot()["upstreams"]}
+        return names.issubset(tried)

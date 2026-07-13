@@ -1,8 +1,9 @@
 """MCP control plane for the JA3 proxy.
 
-Exposes streamable-HTTP MCP tools (served at /mcp, matching the burp-mcp convention) that
-let an agent tune the impersonation profile during a run. Runs on a background uvicorn
-thread; tools mutate the shared ProfileStore that the mitmproxy addon reads.
+Exposes streamable-HTTP MCP tools (served at /mcp) that let an AI/LLM agent (or any MCP
+client) tune the impersonation profile and the upstream proxy pool during a run. Runs on a
+background uvicorn thread; tools mutate the shared ProfileStore + UpstreamPool that the
+mitmproxy addon reads.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from .state import FALLBACK_PROFILES, ProfileStore
+from .state import FALLBACK_PROFILES, STRATEGIES, ProfileStore, UpstreamPool
 
 
 def available_profiles() -> list[str]:
@@ -41,8 +42,10 @@ def available_profiles() -> list[str]:
     return list(FALLBACK_PROFILES)
 
 
-def build_mcp(store: ProfileStore) -> FastMCP:
+def build_mcp(store: ProfileStore, pool: UpstreamPool) -> FastMCP:
     mcp = FastMCP("ja3-proxy")
+
+    # ---- impersonation ----------------------------------------------------------------
 
     @mcp.tool()
     def set_impersonation_profile(browser: str, host: Optional[str] = None) -> dict:
@@ -50,29 +53,22 @@ def build_mcp(store: ProfileStore) -> FastMCP:
 
         browser: a curl_cffi impersonation target (e.g. "chrome", "chrome131",
             "safari18_0", "firefox133"). Call list_profiles() for the valid set.
-        host: if given, applies only to that target host (e.g. "www.example.com");
-            otherwise sets the global default used for all hosts without an override.
-        Returns the new profile state.
+        host: if given, applies only to that target host; otherwise sets the global default.
         """
         valid = available_profiles()
         if valid and browser not in valid:
-            return {
-                "ok": False,
-                "error": f"unknown profile '{browser}'",
-                "available": valid,
-            }
-        state = store.set_profile(browser, host)
-        return {"ok": True, "state": state}
+            return {"ok": False, "error": f"unknown profile '{browser}'", "available": valid}
+        return {"ok": True, "state": store.set_profile(browser, host)}
 
     @mcp.tool()
     def clear_host_profile(host: str) -> dict:
-        """Remove a per-host override so `host` falls back to the global default profile."""
+        """Remove a per-host profile override so `host` falls back to the global default."""
         return {"ok": True, "state": store.clear_host(host)}
 
     @mcp.tool()
     def get_impersonation_profile(host: Optional[str] = None) -> dict:
         """Show the current profile state. If `host` is given, also resolve it for that host."""
-        result = {"state": store.snapshot()}
+        result: dict = {"state": store.snapshot()}
         if host:
             result["resolved_for_host"] = store.resolve(host)
         return result
@@ -82,22 +78,91 @@ def build_mcp(store: ProfileStore) -> FastMCP:
         """List the impersonation targets curl_cffi supports in this environment."""
         return {"profiles": available_profiles()}
 
+    # ---- upstream proxy pool ----------------------------------------------------------
+
+    @mcp.tool()
+    def add_upstream(url: str, name: Optional[str] = None, weight: int = 1, tags: Optional[list[str]] = None) -> dict:
+        """Add an upstream proxy to the pool.
+
+        url: an http(s)://[user:pass@]host:port or socks5://host:port URL. The special value
+            "direct" (or "none") means "send with no upstream" — add it to let the pool rotate
+            to direct egress.
+        name: optional label (auto-assigned "upN" if omitted).
+        weight: relative weight for the `weighted` strategy (default 1).
+        tags: optional labels (e.g. ["residential", "us"]) for your own bookkeeping.
+        """
+        return {"ok": True, "state": pool.add(url, name=name, weight=weight, tags=tags)}
+
+    @mcp.tool()
+    def remove_upstream(name: str) -> dict:
+        """Remove an upstream from the pool by name. Hosts using it re-pick on next request."""
+        return {"ok": True, "state": pool.remove(name)}
+
+    @mcp.tool()
+    def list_upstreams() -> dict:
+        """Show the pool: every upstream with health + stats, the strategy, and per-host
+        pins / sticky assignments / block lists."""
+        return pool.snapshot()
+
+    @mcp.tool()
+    def set_upstream_strategy(strategy: str) -> dict:
+        """How a fresh (or rotated) host is assigned an upstream. Stickiness is always on —
+        an assigned host keeps its upstream until it fails, gets blocked, or is rotated.
+
+        strategy: one of round_robin (spread hosts evenly), random, weighted (by `weight`),
+            or first (least-loaded first).
+        """
+        if strategy not in STRATEGIES:
+            return {"ok": False, "error": f"unknown strategy '{strategy}'", "valid": list(STRATEGIES)}
+        return {"ok": True, "state": pool.set_strategy(strategy)}
+
+    @mcp.tool()
+    def pin_host_upstream(host: str, name: str) -> dict:
+        """Force `host` to always egress through upstream `name` (use "direct" for no proxy).
+        Overrides sticky selection and block-rotation for that host."""
+        try:
+            return {"ok": True, "state": pool.pin(host, name)}
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @mcp.tool()
+    def unpin_host_upstream(host: str) -> dict:
+        """Remove a host pin so `host` returns to automatic selection."""
+        return {"ok": True, "state": pool.unpin(host)}
+
+    @mcp.tool()
+    def rotate_host_upstream(host: str) -> dict:
+        """Rotate `host` to a fresh upstream on its next request (get a new egress IP), and
+        clear that host's block list so previously-blocked upstreams get another chance.
+        Use when a target starts blocking the current egress."""
+        return {"ok": True, "state": pool.rotate(host)}
+
+    @mcp.tool()
+    def set_upstream_health(name: str, healthy: bool) -> dict:
+        """Manually mark an upstream healthy or benched (overrides automatic health)."""
+        try:
+            return {"ok": True, "state": pool.set_health(name, healthy)}
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+
     @mcp.tool()
     def set_upstream_chain(url: Optional[str] = None) -> dict:
-        """Chain the proxy through a further upstream (e.g. an IP-rotating proxy).
-
-        url: an http(s) proxy URL to route target traffic through after impersonation,
-            or null/empty to send directly. Impersonation still applies either way.
+        """Backward-compatible shorthand: replace the whole pool with a single upstream `url`
+        (or clear the pool for direct egress when omitted). Prefer add_upstream for a real pool.
         """
-        return {"ok": True, "state": store.set_upstream_chain(url)}
+        for u in list(pool.snapshot()["upstreams"]):
+            pool.remove(u["name"])
+        if url:
+            pool.add(url, name="chain")
+        return {"ok": True, "state": pool.snapshot()}
+
+    # ---- audit ------------------------------------------------------------------------
 
     @mcp.tool()
     def get_egress_log(limit: int = 50) -> dict:
-        """Recent upstream requests the proxy re-originated, newest first.
-
-        Each entry records the host, method, path, the profile actually presented, and the
-        upstream status (or error). Use this to confirm the intended JA3 was used.
-        """
+        """Recent upstream requests the proxy re-originated, newest first — host, method, path,
+        the profile + upstream actually used, and the status (or error). Use this to confirm
+        which egress + JA3 was presented and whether a host is being blocked."""
         return {"entries": store.recent(limit)}
 
     return mcp

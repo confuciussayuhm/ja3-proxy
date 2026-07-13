@@ -46,14 +46,69 @@ control plane is reachable by any MCP client at `http://127.0.0.1:9877/mcp` (sta
 
 ## MCP tools
 
+**Impersonation**
+
 | Tool | Purpose |
 |---|---|
 | `set_impersonation_profile(browser, host?)` | Set the global (or per-host) JA3/h2 profile |
 | `clear_host_profile(host)` | Drop a per-host override |
 | `get_impersonation_profile(host?)` | Show current state; resolve for a host |
 | `list_profiles()` | curl_cffi impersonation targets available here |
-| `set_upstream_chain(url?)` | Chain through a further upstream (IP rotation) |
-| `get_egress_log(limit?)` | Recent re-originated requests + the JA3 actually presented |
+
+**Upstream proxy pool** (see [Upstream proxy pool](#upstream-proxy-pool))
+
+| Tool | Purpose |
+|---|---|
+| `add_upstream(url, name?, weight?, tags?)` | Add a proxy to the pool (`socks5://…`, `http://user:pass@…`, or `direct`) |
+| `remove_upstream(name)` | Remove a proxy from the pool |
+| `list_upstreams()` | Pool + per-upstream health/stats + per-host pins/sticky/blocks |
+| `set_upstream_strategy(strategy)` | Assignment strategy: `round_robin` \| `random` \| `weighted` \| `first` |
+| `pin_host_upstream(host, name)` | Force a host to a specific upstream (or `direct`) |
+| `unpin_host_upstream(host)` | Remove a host pin |
+| `rotate_host_upstream(host)` | Give a host a fresh egress IP + clear its block list |
+| `set_upstream_health(name, healthy)` | Manually bench / un-bench an upstream |
+| `set_upstream_chain(url?)` | Back-compat shorthand: replace the pool with a single upstream |
+
+**Audit**
+
+| Tool | Purpose |
+|---|---|
+| `get_egress_log(limit?)` | Recent requests + the profile **and upstream** actually used, and status |
+
+## Upstream proxy pool
+
+You can give the proxy a **pool of upstream proxies** and it will choose one per request
+intelligently, rather than pinning everything to a single egress. curl (and therefore
+curl_cffi) can only route through one proxy per request, so this is smart *selection* across
+a pool — not literal multi-hop chaining.
+
+Seed the pool at startup, or manage it live over MCP:
+
+```powershell
+python -m ja3proxy --proxy-port 8081 --mcp-port 9877 --profile chrome `
+  --upstream socks5://5.6.7.8:1080 `
+  --upstream http://user:pass@1.2.3.4:8000 `
+  --upstream-strategy round_robin
+# or: --upstreams-file proxies.txt   (one URL per line, # comments allowed)
+```
+
+How it chooses ("intelligently"):
+
+- **Sticky per host.** Once a target host is assigned an upstream it keeps it, so a session's
+  egress IP stays stable — switching IPs mid-session is a classic anti-fraud trip.
+- **Health-aware failover.** An upstream that hits a few consecutive connection failures is
+  benched and automatically retried later; within a single request the proxy fails over to the
+  next healthy upstream (and finally to direct) so a dead proxy never drops the request.
+- **Block-aware rotation.** When a host starts returning `403`/`429` through one upstream, that
+  upstream is blocked *for that host* and the host rotates to a different egress on its next
+  request. Call `rotate_host_upstream(host)` to force a fresh IP immediately.
+- **Assignment strategy** for fresh/rotated hosts: `round_robin` (spread evenly, default),
+  `random`, `weighted` (by `weight`), or `first` (least-loaded first).
+- **Pin / direct.** `pin_host_upstream(host, name)` forces a host to one upstream; add an entry
+  with url `direct` to let rotation include no-proxy egress; an empty pool = always direct.
+
+`list_upstreams()` shows health + stats + per-host assignments; `get_egress_log()` records the
+upstream actually used per request, so an agent can see what egress a target is blocking.
 
 ## Verify the fingerprint
 

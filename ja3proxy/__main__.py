@@ -1,14 +1,18 @@
 """Entry point: run the impersonating MITM proxy and the MCP control plane together.
 
-    python -m ja3proxy --proxy-port 8081 --mcp-port 9877 --profile chrome
+    python -m ja3proxy --proxy-port 8081 --mcp-port 9877 --profile chrome \
+        --upstream http://user:pass@1.2.3.4:8000 --upstream socks5://5.6.7.8:1080 \
+        --upstream-strategy round_robin
 
 - The MITM proxy listens on 127.0.0.1:<proxy-port>. Point Burp's *upstream proxy* at it.
 - The MCP control plane listens on <mcp-host>:<mcp-port>/mcp (127.0.0.1 by default). An MCP
   client (e.g. an AI/LLM agent) connects there. To reach it from another machine, start with
   --mcp-host 0.0.0.0 and connect to this host's address.
+- Upstream proxies (optional) form a pool; the proxy chooses one per host (sticky), with
+  health-aware failover and block-aware rotation. Manage the pool live over MCP.
 
-Both run in one process sharing a thread-safe ProfileStore: mitmproxy on the main asyncio
-loop, uvicorn (MCP) on a daemon thread.
+Both run in one process sharing thread-safe state: mitmproxy on the main asyncio loop,
+uvicorn (MCP) on a daemon thread.
 """
 
 from __future__ import annotations
@@ -22,12 +26,12 @@ from mitmproxy import options
 from mitmproxy.tools.dump import DumpMaster
 
 from .mcp_app import build_mcp
-from .state import ProfileStore
+from .state import ProfileStore, UpstreamPool
 from .upstream import ImpersonateUpstream
 
 
-def _start_mcp(store: ProfileStore, host: str, port: int) -> None:
-    app = build_mcp(store).streamable_http_app()
+def _start_mcp(store: ProfileStore, pool: UpstreamPool, host: str, port: int) -> None:
+    app = build_mcp(store, pool).streamable_http_app()
     config = uvicorn.Config(app, host=host, port=port, log_level="warning")
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, name="ja3-mcp", daemon=True)
@@ -35,7 +39,25 @@ def _start_mcp(store: ProfileStore, host: str, port: int) -> None:
     print(f"[ja3-proxy] MCP control plane on http://{host}:{port}/mcp")
 
 
-async def _run_proxy(store: ProfileStore, args: argparse.Namespace) -> None:
+def _build_pool(args: argparse.Namespace) -> UpstreamPool:
+    pool = UpstreamPool(strategy=args.upstream_strategy)
+    seeds: list[str] = list(args.upstream or [])
+    if args.upstreams_file:
+        with open(args.upstreams_file, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    seeds.append(line)
+    for url in seeds:
+        pool.add(url)
+    if seeds:
+        print(f"[ja3-proxy] upstream pool: {len(seeds)} proxies, strategy={pool.strategy}")
+    else:
+        print("[ja3-proxy] upstream pool: empty (direct egress) — add proxies via MCP or --upstream")
+    return pool
+
+
+async def _run_proxy(store: ProfileStore, pool: UpstreamPool, args: argparse.Namespace) -> None:
     opts = options.Options(listen_host=args.proxy_host, listen_port=args.proxy_port)
     master = DumpMaster(opts, with_termlog=True, with_dumper=False)
 
@@ -48,7 +70,7 @@ async def _run_proxy(store: ProfileStore, args: argparse.Namespace) -> None:
         updates["confdir"] = args.ca_dir
     master.options.update(**updates)
 
-    master.addons.add(ImpersonateUpstream(store, verify_upstream=not args.insecure))
+    master.addons.add(ImpersonateUpstream(store, pool, verify_upstream=not args.insecure))
     print(
         f"[ja3-proxy] MITM proxy on http://{args.proxy_host}:{args.proxy_port} "
         f"(default profile: {store.default_profile}) — set Burp's upstream proxy to this"
@@ -69,13 +91,32 @@ def main() -> None:
         action="store_true",
         help="do not verify the real target's TLS cert on the upstream leg",
     )
+    parser.add_argument(
+        "--upstream",
+        action="append",
+        metavar="URL",
+        help="upstream proxy to add to the pool (repeatable); http(s)://[user:pass@]host:port or socks5://host:port",
+    )
+    parser.add_argument(
+        "--upstreams-file",
+        default=None,
+        metavar="PATH",
+        help="file with one upstream proxy URL per line (# comments / blank lines ignored)",
+    )
+    parser.add_argument(
+        "--upstream-strategy",
+        default="round_robin",
+        choices=("round_robin", "random", "weighted", "first"),
+        help="how a fresh host is assigned an upstream (stickiness is always on)",
+    )
     args = parser.parse_args()
 
     store = ProfileStore(default_profile=args.profile)
-    _start_mcp(store, args.mcp_host, args.mcp_port)
+    pool = _build_pool(args)
+    _start_mcp(store, pool, args.mcp_host, args.mcp_port)
 
     try:
-        asyncio.run(_run_proxy(store, args))
+        asyncio.run(_run_proxy(store, pool, args))
     except KeyboardInterrupt:
         print("\n[ja3-proxy] shutting down")
 
