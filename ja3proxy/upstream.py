@@ -52,10 +52,18 @@ _MAX_FAILOVER = 4
 class ImpersonateUpstream:
     """Delegates the upstream leg of every proxied request to curl_cffi, via the pool."""
 
-    def __init__(self, store: ProfileStore, pool: UpstreamPool, *, verify_upstream: bool = True) -> None:
+    def __init__(
+        self,
+        store: ProfileStore,
+        pool: UpstreamPool,
+        *,
+        verify_upstream: bool = True,
+        allow_direct_fallback: bool = False,
+    ) -> None:
         self._store = store
         self._pool = pool
         self._verify_upstream = verify_upstream
+        self._allow_direct_fallback = allow_direct_fallback
 
     async def request(self, flow: http.HTTPFlow) -> None:
         # Skip requests already answered (e.g. by an earlier addon) or CONNECTs.
@@ -139,8 +147,21 @@ class ImpersonateUpstream:
 
         for _ in range(_MAX_FAILOVER):
             upstream = self._pool.select(host, exclude=tried)
-            name = upstream.name if upstream is not None else DIRECT_NAME
-            proxies = upstream.proxies() if upstream is not None else None
+            if upstream is None:
+                # No eligible upstream. Fall back to direct egress ONLY when the operator
+                # opted in: an empty pool (direct is the intended egress), or --allow-direct-
+                # fallback. With a configured proxy pool that's merely exhausted (all upstreams
+                # unhealthy or blocked for this host), refuse direct so the client's real IP
+                # never leaks — surface a 502 instead.
+                if self._pool.has_proxy_upstreams() and not self._allow_direct_fallback:
+                    raise last_exc or RuntimeError(
+                        "all upstreams exhausted (unhealthy or blocked for this host); "
+                        "refusing direct egress to avoid leaking the real IP — rotate/add "
+                        "upstreams, or pass --allow-direct-fallback to permit direct"
+                    )
+                name, proxies = DIRECT_NAME, None
+            else:
+                name, proxies = upstream.name, upstream.proxies()
 
             try:
                 resp = cffi.request(
@@ -158,8 +179,8 @@ class ImpersonateUpstream:
                 last_exc = exc
                 self._pool.record_result(host, name, ok=False)
                 tried.add(name)
-                # If the only remaining option is direct and we've tried it, stop.
-                if name == DIRECT_NAME and proxies is None and name in tried and self._pool_exhausted(tried):
+                # Direct has no further fallback, so stop once it fails.
+                if name == DIRECT_NAME:
                     break
                 continue
 
@@ -168,7 +189,3 @@ class ImpersonateUpstream:
             return resp, name
 
         raise last_exc if last_exc is not None else RuntimeError("no upstream available")
-
-    def _pool_exhausted(self, tried: set[str]) -> bool:
-        names = {u["name"] for u in self._pool.snapshot()["upstreams"]}
-        return names.issubset(tried)

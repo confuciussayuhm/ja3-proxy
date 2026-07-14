@@ -142,14 +142,19 @@ How it chooses ("intelligently"):
   egress IP stays stable — switching IPs mid-session is a classic anti-fraud trip.
 - **Health-aware failover.** An upstream that hits a few consecutive connection failures is
   benched and automatically retried later; within a single request the proxy fails over to the
-  next healthy upstream (and finally to direct) so a dead proxy never drops the request.
+  next healthy upstream so a dead proxy never drops the request.
+- **No silent real-IP leak.** When a configured pool is *exhausted* — every upstream unhealthy
+  or blocked for this host — the request fails with a `502` rather than quietly egressing from
+  your real IP. Direct egress happens only when you opt in: an empty pool, an explicit `direct`
+  pool entry, or `--allow-direct-fallback` (which restores best-effort fall-through to direct).
 - **Block-aware rotation.** When a host starts returning `403`/`429` through one upstream, that
   upstream is blocked *for that host* and the host rotates to a different egress on its next
   request. Call `rotate_host_upstream(host)` to force a fresh IP immediately.
 - **Assignment strategy** decides which upstream a *fresh or rotated* host gets (see
   [Assignment strategies](#assignment-strategies) below); stickiness then keeps it there.
 - **Pin / direct.** `pin_host_upstream(host, name)` forces a host to one upstream; add an entry
-  with url `direct` to let rotation include no-proxy egress; an empty pool = always direct.
+  with url `direct` to let rotation include no-proxy egress; an empty pool = always direct. See
+  the leak note above for when direct is (and isn't) used automatically.
 
 Health/block defaults: an upstream is benched after **3** consecutive connection failures and
 auto-retried after **120s**; a host **blocks** an upstream after **3** blocking responses

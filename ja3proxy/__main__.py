@@ -94,7 +94,14 @@ async def _run_proxy(store: ProfileStore, pool: UpstreamPool, args: argparse.Nam
         updates["ignore_hosts"] = list(args.ignore_hosts)
     master.options.update(**updates)
 
-    master.addons.add(ImpersonateUpstream(store, pool, verify_upstream=not args.insecure))
+    master.addons.add(
+        ImpersonateUpstream(
+            store,
+            pool,
+            verify_upstream=not args.insecure,
+            allow_direct_fallback=args.allow_direct_fallback,
+        )
+    )
     print(
         f"[ja3-proxy] MITM proxy on http://{args.proxy_host}:{args.proxy_port} "
         f"(default profile: {store.default_profile}) — set Burp's upstream proxy to this"
@@ -134,6 +141,13 @@ def main() -> None:
         default=None,
         metavar="PATH",
         help="file with one upstream proxy URL per line (# comments / blank lines ignored)",
+    )
+    parser.add_argument(
+        "--allow-direct-fallback",
+        action="store_true",
+        help="permit direct (no-proxy) egress when the whole pool is exhausted "
+        "(unhealthy/blocked). Off by default: with a configured pool, an exhausted request "
+        "fails with 502 rather than silently leaking the real IP. An empty pool always egresses direct.",
     )
     parser.add_argument(
         "--upstream-strategy",

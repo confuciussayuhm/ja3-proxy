@@ -204,6 +204,14 @@ class UpstreamPool:
                     self._host_pinned.pop(h, None)
             return self._snapshot_locked()
 
+    def has_proxy_upstreams(self) -> bool:
+        """True if any real *proxy* upstream is configured (a bare `direct` entry doesn't
+        count). When True, the addon refuses to silently fall back to direct egress once the
+        pool is exhausted, so a client's real IP never leaks; direct then requires an explicit
+        `direct` pool entry (which participates in selection normally) or an empty pool."""
+        with self._lock:
+            return any(not u.is_direct() for u in self._upstreams.values())
+
     def set_strategy(self, strategy: str) -> dict:
         with self._lock:
             if strategy not in STRATEGIES:
