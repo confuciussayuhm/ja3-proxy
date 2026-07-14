@@ -58,8 +58,16 @@ def _quiet_logging() -> None:
     logging.getLogger("mitmproxy.proxy.server").setLevel(logging.WARNING)
 
 
+def _parse_block_statuses(spec: str) -> set[int]:
+    """Parse --rotate-on-status ("403,429", or "" / "none" to disable) into a code set."""
+    spec = (spec or "").strip().lower()
+    if spec in ("", "none", "off"):
+        return set()
+    return {int(part) for part in spec.replace(" ", "").split(",") if part}
+
+
 def _build_pool(args: argparse.Namespace) -> UpstreamPool:
-    pool = UpstreamPool(strategy=args.upstream_strategy)
+    pool = UpstreamPool(strategy=args.upstream_strategy, scope=args.upstream_scope)
     seeds: list[str] = list(args.upstream or [])
     if args.upstreams_file:
         with open(args.upstreams_file, encoding="utf-8") as f:
@@ -100,6 +108,9 @@ async def _run_proxy(store: ProfileStore, pool: UpstreamPool, args: argparse.Nam
             pool,
             verify_upstream=not args.insecure,
             allow_direct_fallback=args.allow_direct_fallback,
+            block_statuses=_parse_block_statuses(args.rotate_on_status),
+            connect_timeout=args.connect_timeout,
+            read_timeout=args.read_timeout,
         )
     )
     print(
@@ -150,10 +161,41 @@ def main() -> None:
         "fails with 502 rather than silently leaking the real IP. An empty pool always egresses direct.",
     )
     parser.add_argument(
+        "--rotate-on-status",
+        default="403,429",
+        metavar="CODES",
+        help="comma-separated HTTP status codes treated as an egress block (drives block-aware "
+        "rotation); the response is still returned. Default 403,429. Use \"none\" to disable "
+        "(e.g. when the app returns 403 as a normal reply and you don't want it rotating egress).",
+    )
+    parser.add_argument(
+        "--connect-timeout",
+        type=float,
+        default=8.0,
+        metavar="SECONDS",
+        help="per-upstream TCP/proxy connect timeout (default 8). Keeps a dead proxy from "
+        "stalling the request for curl's ~21s default before failing over.",
+    )
+    parser.add_argument(
+        "--read-timeout",
+        type=float,
+        default=120.0,
+        metavar="SECONDS",
+        help="upstream response timeout after connect (default 120).",
+    )
+    parser.add_argument(
         "--upstream-strategy",
         default="round_robin",
         choices=("round_robin", "random", "weighted", "first"),
         help="how a fresh host is assigned an upstream (stickiness is always on)",
+    )
+    parser.add_argument(
+        "--upstream-scope",
+        default="host",
+        choices=("host", "global"),
+        help="stickiness scope: 'host' (default) pins each host to its own upstream; 'global' "
+        "routes ALL hosts through one active upstream and rotates them together when it is "
+        "benched, blocked, or rotated. Change live over MCP with set_upstream_scope.",
     )
     args = parser.parse_args()
 

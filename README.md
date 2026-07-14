@@ -68,6 +68,7 @@ control plane is reachable by any MCP client at `http://127.0.0.1:9877/mcp` (sta
 | `remove_upstream(name)` | Remove a proxy from the pool |
 | `list_upstreams()` | Pool + per-upstream health/stats + per-host pins/sticky/blocks |
 | `set_upstream_strategy(strategy)` | Assignment strategy: `round_robin` \| `random` \| `weighted` \| `first` |
+| `set_upstream_scope(scope)` | Stickiness scope: `host` (one IP per host) \| `global` (one active IP for all hosts) |
 | `pin_host_upstream(host, name)` | Force a host to a specific upstream (or `direct`) |
 | `unpin_host_upstream(host)` | Remove a host pin |
 | `rotate_host_upstream(host)` | Give a host a fresh egress IP + clear its block list |
@@ -141,15 +142,22 @@ How it chooses ("intelligently"):
 - **Sticky per host.** Once a target host is assigned an upstream it keeps it, so a session's
   egress IP stays stable — switching IPs mid-session is a classic anti-fraud trip.
 - **Health-aware failover.** An upstream that hits a few consecutive connection failures is
-  benched and automatically retried later; within a single request the proxy fails over to the
-  next healthy upstream so a dead proxy never drops the request.
-- **No silent real-IP leak.** When a configured pool is *exhausted* — every upstream unhealthy
-  or blocked for this host — the request fails with a `502` rather than quietly egressing from
-  your real IP. Direct egress happens only when you opt in: an empty pool, an explicit `direct`
-  pool entry, or `--allow-direct-fallback` (which restores best-effort fall-through to direct).
-- **Block-aware rotation.** When a host starts returning `403`/`429` through one upstream, that
-  upstream is blocked *for that host* and the host rotates to a different egress on its next
-  request. Call `rotate_host_upstream(host)` to force a fresh IP immediately.
+  benched and auto-retried later; within a single request the proxy fails over to the next
+  healthy upstream so a dead proxy never drops the request. A dead proxy fails after
+  `--connect-timeout` (default 8s) instead of curl's ~21s default, so failover is snappy.
+- **Degraded last resort, not a premature 502.** If every upstream is benched or blocked, the
+  proxy retries the least-bad one anyway (a proxy — **never** direct) before giving up. A
+  transient bench or a stale block therefore can't turn into a spurious failure while working
+  egress still exists; only a request where *every* proxy genuinely fails to connect errors out.
+- **No silent real-IP leak.** With a configured pool, a request where all proxies fail returns
+  a `502` rather than quietly egressing from your real IP. Direct egress happens only when you
+  opt in: an empty pool, an explicit `direct` pool entry, or `--allow-direct-fallback`.
+- **Block-aware rotation (self-healing).** When a host returns a blocking status through one
+  upstream, that upstream is blocked *for that host* and the host rotates to a different egress.
+  Blocks **auto-expire** (default 120s) so the pool recovers on its own — no manual rotate
+  needed. Which codes count is configurable with `--rotate-on-status` (default `403,429`); set
+  it to `none` when the app returns `403`/`429` as a normal reply and you don't want those
+  rotating egress. `rotate_host_upstream(host)` still forces a fresh IP immediately.
 - **Assignment strategy** decides which upstream a *fresh or rotated* host gets (see
   [Assignment strategies](#assignment-strategies) below); stickiness then keeps it there.
 - **Pin / direct.** `pin_host_upstream(host, name)` forces a host to one upstream; add an entry
@@ -158,7 +166,7 @@ How it chooses ("intelligently"):
 
 Health/block defaults: an upstream is benched after **3** consecutive connection failures and
 auto-retried after **120s**; a host **blocks** an upstream after **3** blocking responses
-(`403`/`429`) through it and rotates to a different egress.
+(`403`/`429` by default) through it, and that block auto-expires after **120s**.
 
 ### Assignment strategies
 
@@ -174,6 +182,20 @@ already tried this request.
 | `random` | Picks an eligible upstream uniformly at random. | You want unpredictable assignment with no ordering bias. |
 | `weighted` | Random pick weighted by each upstream's `weight` (set via `add_upstream(..., weight=N)`; minimum 1). | Some proxies are faster or higher-quota and should carry proportionally more hosts. |
 | `first` | Least-loaded first: the eligible upstream with the fewest lifetime requests, ties broken by add order. | You want to warm/fill proxies in order, or keep load on the earliest-listed. |
+
+### Stickiness scope
+
+The strategy decides *which* upstream a new assignment gets; the **scope** decides *how many*
+assignments exist at once. Set at startup with `--upstream-scope <host|global>` or live with
+`set_upstream_scope(scope)`.
+
+| Scope | Behaviour | Use when |
+|---|---|---|
+| `host` *(default)* | Each target host is assigned its own upstream independently and sticks to it, so several egress IPs are in flight simultaneously (one per host). | You're hitting many hosts and want them spread across the pool, each with a stable per-session IP. |
+| `global` | **One** active upstream carries *all* hosts. When it's benched, blocked, or you `rotate_host_upstream(...)`, every host advances to the next upstream together. | You want a single predictable egress IP at a time for the whole run, rotating the entire session to a fresh proxy on demand or on failure. |
+
+In `global` scope `list_upstreams()` reports the current active upstream as `global_sticky`.
+Switching scope clears existing sticky assignments so the new scope takes effect immediately.
 
 `list_upstreams()` shows health + stats + per-host assignments; `get_egress_log()` records the
 upstream actually used per request, so an agent can see what egress a target is blocking.

@@ -42,11 +42,13 @@ _STRIP_RESPONSE_HEADERS = {
     "connection",
 }
 
-# Response codes we treat as the target blocking this egress IP (drives block-aware rotation).
-_BLOCK_STATUS = {403, 429}
+# Default response codes treated as the target blocking this egress IP (drives block-aware
+# rotation). Configurable per run — a 403/429 is often just the app's normal reply, so an
+# operator can narrow or disable this with --rotate-on-status.
+_DEFAULT_BLOCK_STATUS = {403, 429}
 
-# Max upstreams to try on connection failure within a single request.
-_MAX_FAILOVER = 4
+# Hard ceiling on per-request failover attempts, regardless of pool size.
+_MAX_FAILOVER = 32
 
 
 class ImpersonateUpstream:
@@ -59,11 +61,17 @@ class ImpersonateUpstream:
         *,
         verify_upstream: bool = True,
         allow_direct_fallback: bool = False,
+        block_statuses: set[int] | None = None,
+        connect_timeout: float = 8.0,
+        read_timeout: float = 120.0,
     ) -> None:
         self._store = store
         self._pool = pool
         self._verify_upstream = verify_upstream
         self._allow_direct_fallback = allow_direct_fallback
+        self._block_statuses = _DEFAULT_BLOCK_STATUS if block_statuses is None else block_statuses
+        self._connect_timeout = connect_timeout
+        self._read_timeout = read_timeout
 
     async def request(self, flow: http.HTTPFlow) -> None:
         # Skip requests already answered (e.g. by an earlier addon) or CONNECTs.
@@ -139,24 +147,33 @@ class ImpersonateUpstream:
         """Blocking curl_cffi call with pool selection + connection-failure failover.
 
         Runs in a worker thread so the proxy loop stays free. Returns (response, upstream_name).
-        A 403/429 is fed back as a block signal (rotates the host next time) but is returned
-        as-is — only connection errors trigger same-request failover.
+        A blocking status (see block_statuses) is fed back as a block signal (rotates the host
+        next time) but is returned as-is — only connection errors trigger same-request failover.
+
+        Failover tries every healthy upstream first; if all are benched or host-blocked it
+        retries them anyway (a proxy, never direct) before giving up, so a transient bench or a
+        stale block never turns into a spurious 502. Direct egress happens only on opt-in.
         """
         tried: set[str] = set()
         last_exc: Exception | None = None
+        # One attempt per upstream, plus one for the empty-pool/direct case, capped for safety.
+        budget = min(_MAX_FAILOVER, self._pool.size() + 1)
 
-        for _ in range(_MAX_FAILOVER):
+        for _ in range(budget):
+            # Prefer a healthy, unblocked upstream; if none remain, retry a benched/blocked
+            # proxy rather than surfacing a premature failure.
             upstream = self._pool.select(host, exclude=tried)
             if upstream is None:
-                # No eligible upstream. Fall back to direct egress ONLY when the operator
-                # opted in: an empty pool (direct is the intended egress), or --allow-direct-
-                # fallback. With a configured proxy pool that's merely exhausted (all upstreams
-                # unhealthy or blocked for this host), refuse direct so the client's real IP
-                # never leaks — surface a 502 instead.
+                upstream = self._pool.select(host, exclude=tried, allow_degraded=True)
+
+            if upstream is None:
+                # Nothing left to try. Egress direct ONLY when the operator opted in: an empty
+                # pool (direct is intended), or --allow-direct-fallback. With a configured proxy
+                # pool, refuse direct so the client's real IP never leaks — surface the error.
                 if self._pool.has_proxy_upstreams() and not self._allow_direct_fallback:
                     raise last_exc or RuntimeError(
-                        "all upstreams exhausted (unhealthy or blocked for this host); "
-                        "refusing direct egress to avoid leaking the real IP — rotate/add "
+                        "all upstream proxies failed this request (connection errors); "
+                        "refusing direct egress to avoid leaking the real IP — check/add "
                         "upstreams, or pass --allow-direct-fallback to permit direct"
                     )
                 name, proxies = DIRECT_NAME, None
@@ -173,7 +190,7 @@ class ImpersonateUpstream:
                     allow_redirects=False,
                     verify=self._verify_upstream,
                     proxies=proxies,
-                    timeout=120,
+                    timeout=(self._connect_timeout, self._read_timeout),
                 )
             except Exception as exc:  # noqa: BLE001 — connection error: bench + failover
                 last_exc = exc
@@ -184,7 +201,7 @@ class ImpersonateUpstream:
                     break
                 continue
 
-            blocked = resp.status_code in _BLOCK_STATUS
+            blocked = resp.status_code in self._block_statuses
             self._pool.record_result(host, name, ok=True, blocked=blocked)
             return resp, name
 

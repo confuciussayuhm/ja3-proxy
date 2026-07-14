@@ -12,7 +12,7 @@ from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from .state import FALLBACK_PROFILES, STRATEGIES, ProfileStore, UpstreamPool
+from .state import FALLBACK_PROFILES, SCOPES, STRATEGIES, ProfileStore, UpstreamPool
 
 
 def available_profiles() -> list[str]:
@@ -115,6 +115,19 @@ def build_mcp(store: ProfileStore, pool: UpstreamPool) -> FastMCP:
         if strategy not in STRATEGIES:
             return {"ok": False, "error": f"unknown strategy '{strategy}'", "valid": list(STRATEGIES)}
         return {"ok": True, "state": pool.set_strategy(strategy)}
+
+    @mcp.tool()
+    def set_upstream_scope(scope: str) -> dict:
+        """Set the stickiness scope for upstream selection.
+
+        scope: "host" (default) pins each target host to its own upstream, so many egress IPs
+            are in flight at once; "global" uses one active upstream for *all* hosts and rotates
+            every host to the next upstream together when the active one is benched, blocked, or
+            rotated. Switching scope clears current sticky assignments.
+        """
+        if scope not in SCOPES:
+            return {"ok": False, "error": f"unknown scope '{scope}'", "valid": list(SCOPES)}
+        return {"ok": True, "state": pool.set_scope(scope)}
 
     @mcp.tool()
     def pin_host_upstream(host: str, name: str) -> dict:

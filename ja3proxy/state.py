@@ -48,6 +48,11 @@ DIRECT_NAME = "direct"
 # rotated).
 STRATEGIES = ("round_robin", "random", "weighted", "first")
 
+# Stickiness scope: "host" pins each target host to its own upstream (many egress IPs in flight
+# at once); "global" uses one active upstream for *all* hosts and advances every host to the
+# next upstream together when the active one is benched, blocked, or rotated.
+SCOPES = ("host", "global")
+
 
 @dataclass
 class EgressRecord:
@@ -163,22 +168,29 @@ class UpstreamPool:
         self,
         strategy: str = "round_robin",
         *,
+        scope: str = "host",
         failure_threshold: int = 3,
         recovery_seconds: float = 120.0,
         block_threshold: int = 3,
+        block_recovery_seconds: float = 120.0,
     ) -> None:
         self._lock = threading.Lock()
         self._upstreams: dict[str, Upstream] = {}
         self._order: list[str] = []  # insertion order, for round_robin
         self._host_pinned: dict[str, str] = {}
         self._host_sticky: dict[str, str] = {}
-        self._host_blocked: dict[str, set[str]] = {}
+        self._global_sticky: Optional[str] = None  # the one active upstream in "global" scope
+        # host -> {upstream_name: monotonic expiry}. Blocks auto-expire so the pool self-heals
+        # (a 403/429 is often a normal app response, not a permanent egress ban).
+        self._host_blocked: dict[str, dict[str, float]] = {}
         self._host_block_counts: dict[tuple[str, str], int] = {}
         self._rr_index = 0
         self._failure_threshold = failure_threshold
         self._recovery_seconds = recovery_seconds
         self._block_threshold = block_threshold
+        self._block_recovery_seconds = block_recovery_seconds
         self.strategy = strategy if strategy in STRATEGIES else "round_robin"
+        self.scope = scope if scope in SCOPES else "host"
 
     # ---- pool management -------------------------------------------------------------
 
@@ -212,11 +224,27 @@ class UpstreamPool:
         with self._lock:
             return any(not u.is_direct() for u in self._upstreams.values())
 
+    def size(self) -> int:
+        """Number of upstreams in the pool (used to bound the addon's failover budget)."""
+        with self._lock:
+            return len(self._upstreams)
+
     def set_strategy(self, strategy: str) -> dict:
         with self._lock:
             if strategy not in STRATEGIES:
                 raise ValueError(f"unknown strategy '{strategy}' (use {', '.join(STRATEGIES)})")
             self.strategy = strategy
+            return self._snapshot_locked()
+
+    def set_scope(self, scope: str) -> dict:
+        """Switch stickiness scope ("host" or "global"). Clears existing sticky assignments so
+        the new scope takes effect on the next request."""
+        with self._lock:
+            if scope not in SCOPES:
+                raise ValueError(f"unknown scope '{scope}' (use {', '.join(SCOPES)})")
+            self.scope = scope
+            self._host_sticky.clear()
+            self._global_sticky = None
             return self._snapshot_locked()
 
     def pin(self, host: str, name: str) -> dict:
@@ -233,10 +261,13 @@ class UpstreamPool:
 
     def rotate(self, host: str) -> dict:
         """Force `host` to pick a fresh upstream next request; also clears its block list
-        so previously-blocked upstreams get another chance."""
+        so previously-blocked upstreams get another chance. In "global" scope this advances
+        the single active upstream, so every host rotates to the next one together."""
         h = host.lower()
         with self._lock:
             self._host_sticky.pop(h, None)
+            if self.scope == "global":
+                self._global_sticky = None
             self._host_blocked.pop(h, None)
             for key in [k for k in self._host_block_counts if k[0] == h]:
                 self._host_block_counts.pop(key, None)
@@ -256,20 +287,32 @@ class UpstreamPool:
 
     # ---- selection -------------------------------------------------------------------
 
-    def select(self, host: str, exclude: Optional[set[str]] = None) -> Optional[Upstream]:
-        """Pick the upstream for `host`. Returns None to mean direct egress (empty pool, or
-        everything unhealthy/blocked/excluded). `exclude` skips names already tried this
-        request (for the addon's failover loop)."""
+    def select(
+        self, host: str, exclude: Optional[set[str]] = None, *, allow_degraded: bool = False
+    ) -> Optional[Upstream]:
+        """Pick the upstream for `host`. `exclude` skips names already tried this request (for
+        the addon's failover loop).
+
+        Returns None only when nothing is left to try: an empty pool, or every upstream already
+        excluded. With `allow_degraded=True`, if no *healthy, unblocked* upstream remains, it
+        falls back to the least-bad still-untried upstream (benched or host-blocked) rather than
+        giving up — retrying a proxy never leaks the real IP, and a 403/block may have lifted.
+        Degraded picks are not made sticky.
+
+        Stickiness follows `self.scope`: "host" pins each host independently; "global" keeps one
+        active upstream for every host and re-picks (advancing all hosts together) only when that
+        active one is unavailable for this request."""
         exclude = exclude or set()
         h = host.lower()
         now = time.monotonic()
         with self._lock:
             self._recover_locked(now)
-            blocked = self._host_blocked.get(h, set())
+            blocked = self._host_blocked.get(h, {})
 
             def available(u: Upstream) -> bool:
                 return u.name not in exclude and u.name not in blocked and u.unhealthy_until is None
 
+            # Per-host pins always win, in either scope.
             pinned = self._host_pinned.get(h)
             if pinned:
                 if pinned == DIRECT_NAME and DIRECT_NAME not in exclude:
@@ -278,19 +321,32 @@ class UpstreamPool:
                 if u and available(u):
                     return u
 
-            sticky = self._host_sticky.get(h)
-            if sticky:
-                u = self._upstreams.get(sticky)
+            current = self._global_sticky if self.scope == "global" else self._host_sticky.get(h)
+            if current:
+                u = self._upstreams.get(current)
                 if u and available(u):
                     return u
 
             candidates = [u for u in self._upstreams.values() if available(u)]
-            if not candidates:
-                return None  # direct fallback
+            if candidates:
+                chosen = self._pick_locked(candidates)
+                if self.scope == "global":
+                    self._global_sticky = chosen.name
+                else:
+                    self._host_sticky[h] = chosen.name
+                return chosen
 
-            chosen = self._pick_locked(candidates)
-            self._host_sticky[h] = chosen.name
-            return chosen
+            if allow_degraded:
+                # Last resort: any still-untried upstream, even if benched/blocked. Prefer the
+                # one soonest to recover, then fewest failures, then insertion order.
+                degraded = [u for u in self._upstreams.values() if u.name not in exclude]
+                if degraded:
+                    return min(
+                        degraded,
+                        key=lambda u: (u.unhealthy_until or 0.0, u.total_failures, self._order.index(u.name)),
+                    )
+
+            return None
 
     def _pick_locked(self, candidates: list[Upstream]) -> Upstream:
         if self.strategy == "random":
@@ -323,15 +379,21 @@ class UpstreamPool:
                         u.unhealthy_until = time.monotonic() + self._recovery_seconds
                         if self._host_sticky.get(h) == name:
                             self._host_sticky.pop(h, None)
+                        if self._global_sticky == name:  # global scope: rotate everyone off it
+                            self._global_sticky = None
             if blocked and name != DIRECT_NAME:
                 if u is not None:
                     u.total_blocks += 1
                 key = (h, name)
                 self._host_block_counts[key] = self._host_block_counts.get(key, 0) + 1
                 if self._host_block_counts[key] >= self._block_threshold:
-                    self._host_blocked.setdefault(h, set()).add(name)
+                    # Block for this host, but with an expiry so the pool self-heals without a
+                    # manual rotate (a 403/429 may be transient or just the app's normal reply).
+                    self._host_blocked.setdefault(h, {})[name] = time.monotonic() + self._block_recovery_seconds
                     if self._host_sticky.get(h) == name:
                         self._host_sticky.pop(h, None)
+                    if self._global_sticky == name:  # global scope: a block rotates everyone
+                        self._global_sticky = None
 
     # ---- introspection ---------------------------------------------------------------
 
@@ -341,8 +403,11 @@ class UpstreamPool:
 
     def _snapshot_locked(self) -> dict:
         now = time.monotonic()
+        self._recover_locked(now)
         return {
             "strategy": self.strategy,
+            "scope": self.scope,
+            "global_sticky": self._global_sticky,
             "upstreams": [
                 {
                     "name": u.name,
@@ -367,6 +432,14 @@ class UpstreamPool:
             if u.unhealthy_until is not None and now >= u.unhealthy_until:
                 u.unhealthy_until = None
                 u.consecutive_failures = 0
+        # Expire host-blocks whose deadline has passed, and reset their strike count so the
+        # upstream gets a fresh block_threshold's worth of chances for that host.
+        for h in list(self._host_blocked):
+            for name in [n for n, deadline in self._host_blocked[h].items() if now >= deadline]:
+                self._host_blocked[h].pop(name, None)
+                self._host_block_counts.pop((h, name), None)
+            if not self._host_blocked[h]:
+                self._host_blocked.pop(h, None)
 
     def _auto_name_locked(self, url: str) -> str:
         i = 1
