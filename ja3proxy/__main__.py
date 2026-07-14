@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import threading
 
 import uvicorn
@@ -37,6 +38,24 @@ def _start_mcp(store: ProfileStore, pool: UpstreamPool, host: str, port: int) ->
     thread = threading.Thread(target=server.run, name="ja3-mcp", daemon=True)
     thread.start()
     print(f"[ja3-proxy] MCP control plane on http://{host}:{port}/mcp")
+
+
+def _quiet_logging() -> None:
+    """Tame the console noise from the two logging stacks sharing this process.
+
+    FastMCP's constructor runs logging.basicConfig() with a RichHandler on the root logger.
+    mitmproxy logs every event through the root logger too and installs its own TermLog
+    handler, so without this each mitmproxy line prints twice — once rich-formatted, once
+    plain. Drop the RichHandler so mitmproxy's TermLog is the single console sink, then lift
+    the proxy's per-connection logger above INFO so the "client connect"/"client disconnect"
+    chatter (one pair per browser connection) stops flooding the terminal. Genuine warnings
+    and errors from that module still get through.
+    """
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        if type(handler).__name__ == "RichHandler":
+            root.removeHandler(handler)
+    logging.getLogger("mitmproxy.proxy.server").setLevel(logging.WARNING)
 
 
 def _build_pool(args: argparse.Namespace) -> UpstreamPool:
@@ -68,6 +87,11 @@ async def _run_proxy(store: ProfileStore, pool: UpstreamPool, args: argparse.Nam
     updates: dict[str, object] = {"connection_strategy": "lazy"}
     if args.ca_dir:
         updates["confdir"] = args.ca_dir
+    if args.ignore_hosts:
+        # Blindly tunnel these hosts instead of MITM-ing them. Needed for cert-pinning clients
+        # (e.g. Burp Collaborator's polling.oastify.com) that reject the proxy's CA and would
+        # otherwise spam "Client TLS handshake failed" on every poll.
+        updates["ignore_hosts"] = list(args.ignore_hosts)
     master.options.update(**updates)
 
     master.addons.add(ImpersonateUpstream(store, pool, verify_upstream=not args.insecure))
@@ -98,6 +122,14 @@ def main() -> None:
         help="upstream proxy to add to the pool (repeatable); http(s)://[user:pass@]host:port or socks5://host:port",
     )
     parser.add_argument(
+        "--ignore-hosts",
+        action="append",
+        metavar="REGEX",
+        help="host (regex, matched against host[:port]) to tunnel without MITM instead of "
+        "intercepting; repeatable. Use for cert-pinning clients such as Burp Collaborator, "
+        r'e.g. --ignore-hosts "(.*\.)?oastify\.com"',
+    )
+    parser.add_argument(
         "--upstreams-file",
         default=None,
         metavar="PATH",
@@ -114,6 +146,7 @@ def main() -> None:
     store = ProfileStore(default_profile=args.profile)
     pool = _build_pool(args)
     _start_mcp(store, pool, args.mcp_host, args.mcp_port)
+    _quiet_logging()
 
     try:
         asyncio.run(_run_proxy(store, pool, args))

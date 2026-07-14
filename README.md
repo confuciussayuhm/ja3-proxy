@@ -35,8 +35,13 @@ Burp keeps full HTTP-layer fidelity and history; the target sees a real browser 
 ```powershell
 py -m venv .venv; .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-python -m ja3proxy --proxy-port 8081 --mcp-port 9877 --profile chrome
+python -m ja3proxy --proxy-port 8081 --mcp-port 9877 --profile chrome `
+  --ignore-hosts "(.*\.)?oastify\.com"
 ```
+
+`--ignore-hosts "(.*\.)?oastify\.com"` tunnels Burp Collaborator's polling straight through
+rather than MITM-ing it — Collaborator pins its own cert and would otherwise log a
+`Client TLS handshake failed` every poll. Drop it if you don't use Collaborator.
 
 Then in Burp: **Settings -> Network -> Connections -> Upstream proxy servers**, add a rule
 (destination `*`) pointing at `127.0.0.1:8081`. Burp's `enforce_upstream_trust` should be
@@ -75,6 +80,44 @@ control plane is reachable by any MCP client at `http://127.0.0.1:9877/mcp` (sta
 |---|---|
 | `get_egress_log(limit?)` | Recent requests + the profile **and upstream** actually used, and status |
 
+## Impersonation profiles
+
+A profile is a [`curl_cffi`](https://github.com/lexiforest/curl_cffi) impersonation target —
+the browser whose TLS/JA3/JA4 ClientHello and HTTP-2 fingerprint the proxy reproduces on the
+upstream leg. Set the process default with `--profile <name>`, override it live (globally or
+per host) with `set_impersonation_profile(browser, host?)`, drop a per-host override with
+`clear_host_profile(host)`, and inspect the current mapping with
+`get_impersonation_profile(host?)`.
+
+The exact set depends on the installed `curl_cffi` build — call `list_profiles()` (or the
+`curl-cffi list` CLI) for the authoritative list in your environment. The build shipped here
+exposes 53 targets across these families:
+
+| Family | Example values | Notes |
+|---|---|---|
+| Chrome (desktop) | `chrome`, `chrome110`, `chrome131`, `chrome136`, `chrome146` | Chromium TLS stack; the most common bucket |
+| Chrome (Android) | `chrome_android`, `chrome99_android`, `chrome131_android` | mobile Chrome ClientHello |
+| Edge | `edge`, `edge99`, `edge101` | Chromium-based Edge |
+| Firefox | `firefox`, `firefox133`, `firefox144`, `firefox147` | NSS TLS stack — a distinct JA3 bucket from Chromium |
+| Safari (macOS) | `safari`, `safari17_0`, `safari18_0`, `safari260` | Apple SecureTransport fingerprint |
+| Safari (iOS) | `safari_ios`, `safari17_2_ios`, `safari18_4_ios`, `safari260_ios` | mobile Safari |
+| Tor | `tor145` | Tor Browser's Firefox-derived fingerprint |
+
+Choosing a profile:
+
+- **Bare names alias the latest.** `chrome`, `edge`, `firefox`, `safari`, and `safari_ios`
+  resolve to the newest build of that family in the installed `curl_cffi`. Pinning a version
+  (e.g. `chrome131`) is more reproducible across `curl_cffi` upgrades.
+- **Match the family to the defense, the version to the story.** Firefox vs Chromium vs Safari
+  are the coarse JA3 buckets a fingerprint-based WAF keys on; the version digits move finer
+  details (extension ordering, GREASE, ALPN). Pick a version consistent with the User-Agent
+  Burp forwards so the UA and JA3 don't contradict each other.
+- **Unknown names are rejected.** `set_impersonation_profile` validates against
+  `list_profiles()` and returns the available set on a miss; `--profile` is handed to
+  `curl_cffi` as-is at startup.
+- If a `curl_cffi` build doesn't expose an enumerable list, `list_profiles()` falls back to a
+  curated subset (`chrome`, `chrome131`, `firefox133`, `safari18_0`, `edge101`, …).
+
 ## Upstream proxy pool
 
 You can give the proxy a **pool of upstream proxies** and it will choose one per request
@@ -88,7 +131,8 @@ Seed the pool at startup, or manage it live over MCP:
 python -m ja3proxy --proxy-port 8081 --mcp-port 9877 --profile chrome `
   --upstream socks5://5.6.7.8:1080 `
   --upstream http://user:pass@1.2.3.4:8000 `
-  --upstream-strategy round_robin
+  --upstream-strategy round_robin `
+  --ignore-hosts "(.*\.)?oastify\.com"
 # or: --upstreams-file proxies.txt   (one URL per line, # comments allowed)
 ```
 
@@ -102,10 +146,29 @@ How it chooses ("intelligently"):
 - **Block-aware rotation.** When a host starts returning `403`/`429` through one upstream, that
   upstream is blocked *for that host* and the host rotates to a different egress on its next
   request. Call `rotate_host_upstream(host)` to force a fresh IP immediately.
-- **Assignment strategy** for fresh/rotated hosts: `round_robin` (spread evenly, default),
-  `random`, `weighted` (by `weight`), or `first` (least-loaded first).
+- **Assignment strategy** decides which upstream a *fresh or rotated* host gets (see
+  [Assignment strategies](#assignment-strategies) below); stickiness then keeps it there.
 - **Pin / direct.** `pin_host_upstream(host, name)` forces a host to one upstream; add an entry
   with url `direct` to let rotation include no-proxy egress; an empty pool = always direct.
+
+Health/block defaults: an upstream is benched after **3** consecutive connection failures and
+auto-retried after **120s**; a host **blocks** an upstream after **3** blocking responses
+(`403`/`429`) through it and rotates to a different egress.
+
+### Assignment strategies
+
+Set at startup with `--upstream-strategy <name>` or live with `set_upstream_strategy(name)`.
+The strategy only picks the upstream for a host's **first** request (or its first request
+after a rotation or block); stickiness then keeps that host on the chosen upstream. Selection
+is always over the *currently eligible* set — healthy, not blocked for this host, and not
+already tried this request.
+
+| Strategy | Behaviour | Use when |
+|---|---|---|
+| `round_robin` *(default)* | Cycles through the eligible upstreams in the order they were added, so hosts spread evenly across the pool. | You want balanced, even distribution across interchangeable proxies. |
+| `random` | Picks an eligible upstream uniformly at random. | You want unpredictable assignment with no ordering bias. |
+| `weighted` | Random pick weighted by each upstream's `weight` (set via `add_upstream(..., weight=N)`; minimum 1). | Some proxies are faster or higher-quota and should carry proportionally more hosts. |
+| `first` | Least-loaded first: the eligible upstream with the fewest lifetime requests, ties broken by add order. | You want to warm/fill proxies in order, or keep load on the earliest-listed. |
 
 `list_upstreams()` shows health + stats + per-host assignments; `get_egress_log()` records the
 upstream actually used per request, so an agent can see what egress a target is blocking.
@@ -125,3 +188,16 @@ and confirm it changes live. `get_egress_log` shows what was actually presented.
   fingerprints) the target connection itself before we answer from curl_cffi.
 - Header order from Burp is forwarded as-is; `curl_cffi` supplies the browser's TLS/h2
   fingerprint. Hop-by-hop and length/encoding headers are recomputed.
+- **Cert-pinning clients can't be MITM'd.** Burp Collaborator's polling (`polling.oastify.com`,
+  every ~10 min) pins its own certificate and will reject the proxy's CA — you'll see repeated
+  `Client TLS handshake failed … does not trust the proxy's certificate`. That's the pinned
+  client refusing interception, not a problem with your target traffic. Tunnel such hosts
+  straight through with `--ignore-hosts` (repeatable regex, matched against `host[:port]`):
+
+  ```powershell
+  python -m ja3proxy ... --ignore-hosts "(.*\.)?oastify\.com"
+  ```
+
+- Each re-originated request logs one line — `GET example.com/path -> 200 via up2 [chrome]` —
+  so you can watch traffic flow and see the profile + upstream actually used; upstream failures
+  log a warning. `get_egress_log()` has the same data structured, over MCP.

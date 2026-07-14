@@ -13,11 +13,16 @@ The upstream leg is routed through the UpstreamPool: an upstream proxy is chosen
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from curl_cffi import requests as cffi
 from mitmproxy import http
 
 from .state import DIRECT_NAME, EgressRecord, ProfileStore, UpstreamPool
+
+# Emits one concise line per re-originated request so the operator can see traffic flowing.
+# Routes through the root logger, so mitmproxy's TermLog picks it up as the single console sink.
+logger = logging.getLogger("ja3proxy")
 
 # Headers we must not forward verbatim to the upstream client: hop-by-hop, or values
 # curl_cffi will recompute. Content-Encoding/Content-Length on the RESPONSE are also
@@ -80,6 +85,9 @@ class ImpersonateUpstream:
             self._store.record(
                 EgressRecord(host, flow.request.method, flow.request.path, profile, "-", None, str(exc))
             )
+            logger.warning(
+                "%s %s -> upstream error [%s]: %s", flow.request.method, host, profile, exc
+            )
             flow.response = http.Response.make(
                 502,
                 f"ja3-proxy upstream error via '{profile}': {exc}".encode(),
@@ -100,6 +108,15 @@ class ImpersonateUpstream:
         flow.response = http.Response.make(resp.status_code, resp.content, resp_headers)
         self._store.record(
             EgressRecord(host, flow.request.method, flow.request.path, profile, used, resp.status_code)
+        )
+        logger.info(
+            "%s %s%s -> %s via %s [%s]",
+            flow.request.method,
+            host,
+            flow.request.path,
+            resp.status_code,
+            used,
+            profile,
         )
 
     def _fetch_with_pool(
