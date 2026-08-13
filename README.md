@@ -213,8 +213,15 @@ and confirm it changes live. `get_egress_log` shows what was actually presented.
   memory.
 - `connection_strategy=lazy` is required so mitmproxy never pre-establishes (and TLS-
   fingerprints) the target connection itself before we answer from curl_cffi.
-- Header order from Burp is forwarded as-is; `curl_cffi` supplies the browser's TLS/h2
-  fingerprint. Hop-by-hop and length/encoding headers are recomputed.
+- Headers from Burp are forwarded as-is, in order, and **nothing else is added**: the request
+  is sent with `default_headers=False`, so `curl_cffi` contributes only the TLS/h2 fingerprint,
+  never its impersonation profile's canned header set. (With the default on, every request
+  picks up the profile's *navigation* headers — including `Sec-Fetch-User: ?1` and
+  `Upgrade-Insecure-Requests: 1` on XHR/fetch calls, a combination no browser emits and that
+  header-coherence checks in a WAF reject.) Hop-by-hop and length/encoding headers are recomputed.
+- The URL is passed through byte-exact (`quote=False`). `curl_cffi` would otherwise re-quote it
+  and rewrite payloads in flight — `%2e%2e%2f` collapses to `..%2f`, `<script>` becomes
+  `%3Cscript%3E` — so the target would never receive what you sent.
 - **Cert-pinning clients can't be MITM'd.** Burp Collaborator's polling (`polling.oastify.com`,
   every ~10 min) pins its own certificate and will reject the proxy's CA — you'll see repeated
   `Client TLS handshake failed … does not trust the proxy's certificate`. That's the pinned

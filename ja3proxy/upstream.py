@@ -12,10 +12,10 @@ The upstream leg is routed through the UpstreamPool: an upstream proxy is chosen
 
 from __future__ import annotations
 
-import asyncio
 import logging
 
 from curl_cffi import requests as cffi
+from curl_cffi.requests import AsyncSession
 from mitmproxy import http
 
 from .state import DIRECT_NAME, EgressRecord, ProfileStore, UpstreamPool
@@ -64,6 +64,7 @@ class ImpersonateUpstream:
         block_statuses: set[int] | None = None,
         connect_timeout: float = 8.0,
         read_timeout: float = 120.0,
+        debug_headers: bool = False,
     ) -> None:
         self._store = store
         self._pool = pool
@@ -72,6 +73,24 @@ class ImpersonateUpstream:
         self._block_statuses = _DEFAULT_BLOCK_STATUS if block_statuses is None else block_statuses
         self._connect_timeout = connect_timeout
         self._read_timeout = read_timeout
+        # OFF by default: the x-ja3-proxy-profile / -upstream response headers are debug telemetry,
+        # and injecting them into every response POLLUTES the captured traffic — they appear in Burp
+        # history as if the server sent them, can skew response-header-based analysis, and leak the
+        # proxy's presence to the client. The same profile/upstream verdict is always recorded in the
+        # egress log (queryable via the MCP), so nothing is lost by keeping them off the wire.
+        self._debug_headers = debug_headers
+        # Cookie isolation (CRITICAL): a FRESH curl_cffi AsyncSession is created PER REQUEST (in
+        # `request()`), never shared. A shared Session keeps a domain-scoped cookie jar, so the first
+        # login cookie seen for a host (e.g. patient_a on www.doctolib.fr) gets silently re-attached to
+        # every later request to that host — poisoning multi-principal / IDOR / authz testing (a
+        # cookie-less request wrongly returns the banked user's data). The proxy must stay transparent:
+        # only the client's own forwarded Cookie header may reach the target. Per-request sessions also
+        # avoid a shared mutable jar racing across the concurrent requests the proxy drives. Each session
+        # still performs async I/O (no thread-pool ceiling — the point of dropping asyncio.to_thread).
+
+    async def done(self) -> None:
+        """Sessions are per-request (see `request()`), so there is nothing global to tear down."""
+        return
 
     async def request(self, flow: http.HTTPFlow) -> None:
         # Skip requests already answered (e.g. by an earlier addon) or CONNECTs.
@@ -87,56 +106,64 @@ class ImpersonateUpstream:
             if name.lower() not in _STRIP_REQUEST_HEADERS
         ]
 
-        try:
-            resp, used = await asyncio.to_thread(
-                self._fetch_with_pool,
+        # Per-request curl_cffi session: a fresh, EMPTY cookie jar for THIS request only (see the
+        # cookie-isolation note in __init__). The client's own Cookie header rides in `req_headers`;
+        # nothing else is attached, so the proxy stays transparent to sessions. The session stays open
+        # across the response-build below so `resp.content` is materialised before it closes.
+        async with AsyncSession() as session:
+            try:
+                resp, used = await self._fetch_with_pool(
+                    session,
+                    flow.request.method,
+                    flow.request.url,
+                    host,
+                    req_headers,
+                    flow.request.raw_content or b"",
+                    profile,
+                )
+            except Exception as exc:  # noqa: BLE001 — surface any upstream failure as a 502
+                self._store.record(
+                    EgressRecord(host, flow.request.method, flow.request.path, profile, "-", None, str(exc))
+                )
+                logger.warning(
+                    "%s %s -> upstream error [%s]: %s", flow.request.method, host, profile, exc
+                )
+                flow.response = http.Response.make(
+                    502,
+                    f"ja3-proxy upstream error via '{profile}': {exc}".encode(),
+                    {"content-type": "text/plain", "x-ja3-proxy-error": "1"},
+                )
+                return
+
+            # mitmproxy's Response.make requires bytes when headers are given as tuples (the
+            # tuple form, unlike a dict, preserves duplicate headers such as multiple Set-Cookie).
+            resp_headers = [
+                (name.encode("latin-1", "replace"), value.encode("latin-1", "replace"))
+                for name, value in resp.headers.multi_items()
+                if name.lower() not in _STRIP_RESPONSE_HEADERS
+            ]
+            # Only tag the response with the profile/upstream when explicitly debugging — see __init__.
+            if self._debug_headers:
+                resp_headers.append((b"x-ja3-proxy-profile", profile.encode("ascii", "replace")))
+                resp_headers.append((b"x-ja3-proxy-upstream", used.encode("ascii", "replace")))
+
+            flow.response = http.Response.make(resp.status_code, resp.content, resp_headers)
+            self._store.record(
+                EgressRecord(host, flow.request.method, flow.request.path, profile, used, resp.status_code)
+            )
+            logger.info(
+                "%s %s%s -> %s via %s [%s]",
                 flow.request.method,
-                flow.request.url,
                 host,
-                req_headers,
-                flow.request.raw_content or b"",
+                flow.request.path,
+                resp.status_code,
+                used,
                 profile,
             )
-        except Exception as exc:  # noqa: BLE001 — surface any upstream failure as a 502
-            self._store.record(
-                EgressRecord(host, flow.request.method, flow.request.path, profile, "-", None, str(exc))
-            )
-            logger.warning(
-                "%s %s -> upstream error [%s]: %s", flow.request.method, host, profile, exc
-            )
-            flow.response = http.Response.make(
-                502,
-                f"ja3-proxy upstream error via '{profile}': {exc}".encode(),
-                {"content-type": "text/plain", "x-ja3-proxy-error": "1"},
-            )
-            return
 
-        # mitmproxy's Response.make requires bytes when headers are given as tuples (the
-        # tuple form, unlike a dict, preserves duplicate headers such as multiple Set-Cookie).
-        resp_headers = [
-            (name.encode("latin-1", "replace"), value.encode("latin-1", "replace"))
-            for name, value in resp.headers.multi_items()
-            if name.lower() not in _STRIP_RESPONSE_HEADERS
-        ]
-        resp_headers.append((b"x-ja3-proxy-profile", profile.encode("ascii", "replace")))
-        resp_headers.append((b"x-ja3-proxy-upstream", used.encode("ascii", "replace")))
-
-        flow.response = http.Response.make(resp.status_code, resp.content, resp_headers)
-        self._store.record(
-            EgressRecord(host, flow.request.method, flow.request.path, profile, used, resp.status_code)
-        )
-        logger.info(
-            "%s %s%s -> %s via %s [%s]",
-            flow.request.method,
-            host,
-            flow.request.path,
-            resp.status_code,
-            used,
-            profile,
-        )
-
-    def _fetch_with_pool(
+    async def _fetch_with_pool(
         self,
+        session: AsyncSession,
         method: str,
         url: str,
         host: str,
@@ -144,9 +171,11 @@ class ImpersonateUpstream:
         body: bytes,
         profile: str,
     ) -> tuple[cffi.Response, str]:
-        """Blocking curl_cffi call with pool selection + connection-failure failover.
+        """Async curl_cffi call with pool selection + connection-failure failover.
 
-        Runs in a worker thread so the proxy loop stays free. Returns (response, upstream_name).
+        Uses the caller's PER-REQUEST session (see `request()`), so upstream fetches run concurrently on
+        the proxy loop (no thread-pool ceiling) AND carry no cross-request cookie state. Returns
+        (response, upstream_name).
         A blocking status (see block_statuses) is fed back as a block signal (rotates the host
         next time) but is returned as-is — only connection errors trigger same-request failover.
 
@@ -181,7 +210,7 @@ class ImpersonateUpstream:
                 name, proxies = upstream.name, upstream.proxies()
 
             try:
-                resp = cffi.request(
+                resp = await session.request(
                     method,
                     url,
                     headers=headers,
@@ -191,6 +220,26 @@ class ImpersonateUpstream:
                     verify=self._verify_upstream,
                     proxies=proxies,
                     timeout=(self._connect_timeout, self._read_timeout),
+                    # Send ONLY the client's own headers. curl_cffi otherwise merges the
+                    # impersonation profile's canned *navigation* header set underneath ours, so
+                    # every request the client makes picks up headers it never sent — most
+                    # damagingly "Sec-Fetch-User: ?1" and "Upgrade-Insecure-Requests: 1" on an
+                    # XHR/fetch call. That combination is impossible per the Fetch spec
+                    # (Sec-Fetch-User is only emitted for user-activated navigations, where
+                    # Sec-Fetch-Mode is "navigate"), and header-coherence checks in a WAF or bot
+                    # -detection layer reject it — typically with a 400 that looks like the app
+                    # rejecting the request. It also breaks the proxy's transparency contract:
+                    # what the target sees must be what the client actually sent.
+                    # The TLS (JA3/JA4) and HTTP-2 (Akamai) fingerprints come from curl-impersonate's
+                    # socket- and frame-level options, NOT from these headers, so the impersonation
+                    # this proxy exists to provide is unaffected.
+                    default_headers=False,
+                    # Byte-exact URL pass-through. curl_cffi's default runs the URL through
+                    # requests-style requote_uri(), which rewrites test payloads in flight:
+                    # "%2e%2e%2f" collapses to "..%2f" and "<script>" becomes "%3Cscript%3E",
+                    # so the target never receives the payload the operator sent and the finding
+                    # is silently lost. A MITM proxy must not normalise the URI.
+                    quote=False,
                 )
             except Exception as exc:  # noqa: BLE001 — connection error: bench + failover
                 last_exc = exc
