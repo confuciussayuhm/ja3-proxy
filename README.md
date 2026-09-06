@@ -206,11 +206,78 @@ Browse a TLS-fingerprint reflector (e.g. a ja3/ja4 echo service) through Burp an
 reported JA3 matches the selected browser. Flip the profile with `set_impersonation_profile`
 and confirm it changes live. `get_egress_log` shows what was actually presented.
 
+## Upstream TLS verification (`curl: (60)`)
+
+The upstream leg verifies the **real target's** certificate. When it fails you get a 502 whose
+body starts:
+
+```
+ja3-proxy upstream error via 'chrome': ... curl: (60) SSL certificate problem:
+unable to get local issuer certificate
+```
+
+The confusing part is that the same site loads fine in Chrome and in Burp. That usually is not
+interception — it is the **incomplete-chain** case:
+
+- curl verifies against a **roots-only** bundle and, unlike a browser, never chases the
+  certificate's `AuthorityInformationAccess` URL to fetch a missing intermediate.
+- A server that sends only its leaf certificate therefore works everywhere a browser is
+  involved (browsers fetch and cache the intermediate; Windows keeps a store of them) and
+  fails only here.
+
+Diagnose it in one shot — a chain of length 1 with an issuer that is *not* the subject is the
+tell:
+
+```powershell
+python - <<'PY'
+import socket, ssl
+from cryptography import x509
+c = ssl.create_default_context(); c.check_hostname = False; c.verify_mode = ssl.CERT_NONE
+s = c.wrap_socket(socket.create_connection(("TARGET", 443), 10), server_hostname="TARGET")
+leaf = x509.load_der_x509_certificate(s.getpeercert(True))
+print("subject:", leaf.subject.rfc4514_string())
+print("issuer :", leaf.issuer.rfc4514_string())
+print("chain sent by server:", len(s.get_unverified_chain()), "cert(s)")
+PY
+```
+
+Two ways to proceed:
+
+| | Flag | When |
+|---|---|---|
+| **Keep verification on** | `--ca-bundle <pem>` | Preferred. Point it at a PEM containing the roots you still trust **plus** the missing intermediate (or the private/internal root). It **replaces** the default store, so build it as `certifi`'s `cacert.pem` **plus** the extra cert — not the extra cert alone. A genuine interception is still caught. |
+| **Skip verification** | `--insecure` | Quick unblock, or when you don't care what the target's chain says. Note this also hides real interception. |
+
+Building the bundle (fetch the intermediate from the leaf's AIA URL):
+
+```powershell
+python - <<'PY'
+import ssl, certifi, urllib.request
+AIA = "http://cacerts.digicert.com/<the-intermediate-from-the-AIA-extension>.crt"
+pem = ssl.DER_cert_to_PEM_cert(urllib.request.urlopen(AIA, timeout=20).read())
+open("ca-bundle.pem", "w").write(open(certifi.where()).read() + "\n" + pem)
+PY
+
+python -m ja3proxy ... --ca-bundle ca-bundle.pem
+```
+
+`CURL_CA_BUNDLE` / `REQUESTS_CA_BUNDLE` in the environment work too — `curl_cffi` honours both —
+but `--ca-bundle` is validated at startup and echoed in the banner, so it fails loudly on a typo
+instead of looking like the certificate error you were trying to fix.
+
+**A TLS failure never benches an upstream.** It is a verdict about the target's certificate, not
+about the proxy hop, so it is not charged against any upstream's health — otherwise one
+misconfigured host could bench the whole pool for every other host. The proxy tries a *second*
+upstream (a lone TLS-intercepting proxy is indistinguishable from an untrusted target on one
+sample); two upstreams agreeing settles it and the request fails fast rather than walking the
+entire pool for the same deterministic error.
+
 ## Notes / limitations
 
-- The upstream fetch uses `curl_cffi` synchronously inside a worker thread, and the response
-  is buffered (not streamed). Fine for pentest traffic; very large downloads are buffered in
-  memory.
+- The upstream fetch uses `curl_cffi`'s `AsyncSession` on the proxy's own event loop — a fresh
+  session per request, so there is no thread-pool ceiling and no shared cookie jar leaking one
+  request's session cookie onto the next. The response is buffered (not streamed): fine for
+  pentest traffic, but very large downloads are held in memory.
 - `connection_strategy=lazy` is required so mitmproxy never pre-establishes (and TLS-
   fingerprints) the target connection itself before we answer from curl_cffi.
 - Headers from Burp are forwarded as-is, in order, and **nothing else is added**: the request
@@ -222,6 +289,16 @@ and confirm it changes live. `get_egress_log` shows what was actually presented.
 - The URL is passed through byte-exact (`quote=False`). `curl_cffi` would otherwise re-quote it
   and rewrite payloads in flight — `%2e%2e%2f` collapses to `..%2f`, `<script>` becomes
   `%3Cscript%3E` — so the target would never receive what you sent.
+- **`socks://` means SOCKS4, not SOCKS5.** libcurl treats the bare scheme as an alias for
+  `socks4://` — confirmed by capturing the bytes it writes (`socks://` and `socks4://` emit a
+  byte-identical SOCKS4 CONNECT; `socks5://` and `socks5h://` emit the SOCKS5 greeting). A
+  `socks://` entry therefore gets SOCKS4's limits: **no proxy-side DNS** (the target name is
+  resolved *here* and the proxy is handed an IP), no authentication, no IPv6. Prefer
+  `socks5h://` so the tunnel's far side resolves the name — which matters whenever it resolves
+  differently from this host, as internal and split-horizon targets usually do. The pool warns
+  on `socks://`, on a scheme libcurl doesn't know (a typo would otherwise sit there looking like
+  a real upstream and fail as a connect timeout), and on a URL with no scheme at all.
+
 - **Cert-pinning clients can't be MITM'd.** Burp Collaborator's polling (`polling.oastify.com`,
   every ~10 min) pins its own certificate and will reject the proxy's CA — you'll see repeated
   `Client TLS handshake failed … does not trust the proxy's certificate`. That's the pinned

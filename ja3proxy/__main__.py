@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import threading
 
 import uvicorn
@@ -134,6 +135,24 @@ def _quiet_logging(*, verbose_tls: bool = False) -> None:
     logging.getLogger("mitmproxy.master").addFilter(_DropProactorConnectionReset())
 
 
+def _resolve_verify(args: argparse.Namespace) -> bool | str:
+    """Turn --insecure / --ca-bundle into the value curl_cffi's `verify=` expects.
+
+    False disables verification, a str is a CA bundle path (CURLOPT_CAINFO), True keeps curl's
+    own default trust store. The path is checked HERE rather than on first use: a typo would
+    otherwise surface as a per-request 502 on the upstream leg, which reads exactly like the
+    certificate failure the operator reached for --ca-bundle to fix.
+    """
+    if args.insecure:
+        return False
+    if args.ca_bundle:
+        path = os.path.abspath(os.path.expanduser(args.ca_bundle))
+        if not os.path.isfile(path):
+            raise SystemExit(f"[ja3-proxy] --ca-bundle: no such file: {path}")
+        return path
+    return True
+
+
 def _parse_block_statuses(spec: str) -> set[int]:
     """Parse --rotate-on-status ("403,429", or "" / "none" to disable) into a code set."""
     spec = (spec or "").strip().lower()
@@ -160,7 +179,12 @@ def _build_pool(args: argparse.Namespace) -> UpstreamPool:
     return pool
 
 
-async def _run_proxy(store: ProfileStore, pool: UpstreamPool, args: argparse.Namespace) -> None:
+async def _run_proxy(
+    store: ProfileStore,
+    pool: UpstreamPool,
+    args: argparse.Namespace,
+    verify_upstream: bool | str,
+) -> None:
     opts = options.Options(listen_host=args.proxy_host, listen_port=args.proxy_port)
     master = DumpMaster(opts, with_termlog=True, with_dumper=False)
 
@@ -182,7 +206,7 @@ async def _run_proxy(store: ProfileStore, pool: UpstreamPool, args: argparse.Nam
         ImpersonateUpstream(
             store,
             pool,
-            verify_upstream=not args.insecure,
+            verify_upstream=verify_upstream,
             allow_direct_fallback=args.allow_direct_fallback,
             block_statuses=_parse_block_statuses(args.rotate_on_status),
             connect_timeout=args.connect_timeout,
@@ -194,6 +218,13 @@ async def _run_proxy(store: ProfileStore, pool: UpstreamPool, args: argparse.Nam
         f"[ja3-proxy] MITM proxy on http://{args.proxy_host}:{args.proxy_port} "
         f"(default profile: {store.default_profile}) — set Burp's upstream proxy to this"
     )
+    # Upstream TLS verification is the setting most likely to be misremembered between runs
+    # (--insecure silently accepts an intercepted chain), so state it once at startup rather
+    # than leaving the operator to infer it from whether requests happen to be failing.
+    if verify_upstream is False:
+        print("[ja3-proxy] upstream TLS verification: OFF (--insecure)")
+    elif isinstance(verify_upstream, str):
+        print(f"[ja3-proxy] upstream TLS verification: ON, CA bundle {verify_upstream}")
     await master.run()
 
 
@@ -209,6 +240,18 @@ def main() -> None:
         "--insecure",
         action="store_true",
         help="do not verify the real target's TLS cert on the upstream leg",
+    )
+    parser.add_argument(
+        "--ca-bundle",
+        default=None,
+        metavar="PATH",
+        help="PEM bundle to verify the real target's cert against on the upstream leg (curl's "
+        "CAINFO). Use it instead of --insecure when a target serves an INCOMPLETE CHAIN (it omits "
+        "its intermediate — browsers hide this by fetching the intermediate via AIA, curl does "
+        "not) or is signed by a private/internal CA: verification stays on, so a genuine "
+        "interception is still caught. The file REPLACES the default trust store, so build it as "
+        "certifi's cacert.pem plus the extra cert(s), not the extra cert(s) alone. Ignored when "
+        "--insecure is given.",
     )
     parser.add_argument(
         "--upstream",
@@ -292,13 +335,18 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Resolve (and validate) the upstream TLS setting before anything binds a port or starts the
+    # MCP daemon thread, so a bad --ca-bundle path exits cleanly instead of half-starting the
+    # process and then raising out of the proxy's event loop.
+    verify_upstream = _resolve_verify(args)
+
     store = ProfileStore(default_profile=args.profile)
     pool = _build_pool(args)
     _start_mcp(store, pool, args.mcp_host, args.mcp_port)
     _quiet_logging(verbose_tls=args.verbose_tls)
 
     try:
-        asyncio.run(_run_proxy(store, pool, args))
+        asyncio.run(_run_proxy(store, pool, args, verify_upstream))
     except KeyboardInterrupt:
         print("\n[ja3-proxy] shutting down")
 

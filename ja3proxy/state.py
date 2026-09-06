@@ -8,6 +8,7 @@ loop handoff.
 
 from __future__ import annotations
 
+import logging
 import random
 import threading
 import time
@@ -42,6 +43,22 @@ FALLBACK_PROFILES: tuple[str, ...] = (
 # URL values that mean "send directly, no upstream proxy".
 _DIRECT_SENTINELS = {"", "direct", "none"}
 DIRECT_NAME = "direct"
+
+# Shares the addon's logger so pool warnings land in the same console sink as request lines.
+logger = logging.getLogger("ja3proxy")
+
+# Proxy schemes libcurl understands. An upstream URL is otherwise stored verbatim and only
+# fails at request time — as a connect timeout indistinguishable from a genuinely dead proxy —
+# so `add()` warns rather than letting a typo sit in the pool looking like a real entry.
+_KNOWN_SCHEMES = {"http", "https", "socks4", "socks4a", "socks5", "socks5h", "socks"}
+
+# Schemes libcurl resolves the target hostname for LOCALLY, sending the proxy an IP address.
+# `socks://` is the trap: it is an alias for socks4://, NOT socks5:// — verified by capturing the
+# bytes libcurl writes (both emit an identical SOCKS4 CONNECT). So a `socks://` entry also
+# inherits SOCKS4's limits: no proxy-side DNS, no authentication, no IPv6. That matters whenever
+# the far side of the tunnel resolves a name differently from this host — routine for internal or
+# split-horizon targets, where local DNS yields an address the tunnel cannot route to.
+_LOCAL_DNS_SCHEMES = {"socks", "socks4", "socks5"}
 
 # Selection strategies used to assign a *fresh* host to an upstream (stickiness is always
 # on, so an assigned host keeps its upstream until the upstream fails, gets blocked, or is
@@ -120,6 +137,47 @@ class ProfileStore:
         ]
 
 
+def _warn_about_scheme(url: str) -> None:
+    """Flag an upstream URL that libcurl will not use the way the operator probably expects.
+
+    Purely advisory — the URL is still stored verbatim, because "unknown to us" is not the same
+    as "wrong", and an operator debugging a pool should not have entries silently rejected. The
+    warning exists because both failure modes here surface at request time as a connect timeout,
+    which reads exactly like a dead proxy: a scheme typo never announces itself, and a `socks://`
+    entry quietly behaves as SOCKS4 (see _LOCAL_DNS_SCHEMES).
+    """
+    raw = (url or "").strip()
+    if raw.lower() in _DIRECT_SENTINELS:
+        return
+    scheme = raw.split("://", 1)[0].lower() if "://" in raw else ""
+    if not scheme:
+        logger.warning(
+            "upstream %r has no scheme; expected one of %s (e.g. http://host:port)",
+            raw,
+            ", ".join(sorted(_KNOWN_SCHEMES)),
+        )
+        return
+    if scheme not in _KNOWN_SCHEMES:
+        logger.warning(
+            "upstream %r uses unknown proxy scheme %r; libcurl will reject it and every request "
+            "through it will fail. Expected one of %s",
+            raw,
+            scheme,
+            ", ".join(sorted(_KNOWN_SCHEMES)),
+        )
+        return
+    if scheme in _LOCAL_DNS_SCHEMES:
+        alias = " (an alias for socks4://, not socks5://)" if scheme == "socks" else ""
+        logger.warning(
+            "upstream %r uses %r%s, so the target hostname is resolved HERE and the proxy is "
+            "given an IP. If the far side resolves names differently — common for internal or "
+            "split-horizon targets — use socks5h:// (or socks4a://) so the proxy resolves it",
+            raw,
+            f"{scheme}://",
+            alias,
+        )
+
+
 @dataclass
 class Upstream:
     """One upstream proxy in the pool. `url` is an http(s)://... or socks5://... URL, or a
@@ -139,6 +197,16 @@ class Upstream:
 
     def is_direct(self) -> bool:
         return self.url.strip().lower() in _DIRECT_SENTINELS
+
+    def is_tls_proxy(self) -> bool:
+        """True for an `https://` upstream — one we speak TLS to on the way *out*.
+
+        It matters for failure attribution: a TLS error through a plain http:// or socks://
+        upstream can only be about the target (those hops carry our bytes opaquely), but an
+        https:// hop has a certificate of its own that can fail verification, so a TLS error
+        there may be the hop's fault and must still count against its health.
+        """
+        return self.url.strip().lower().startswith("https://")
 
     def proxies(self) -> Optional[dict]:
         """curl_cffi `proxies=` dict, or None for direct egress."""
@@ -195,6 +263,7 @@ class UpstreamPool:
     # ---- pool management -------------------------------------------------------------
 
     def add(self, url: str, name: Optional[str] = None, weight: int = 1, tags: Optional[list[str]] = None) -> dict:
+        _warn_about_scheme(url)
         with self._lock:
             resolved = name or self._auto_name_locked(url)
             self._upstreams[resolved] = Upstream(name=resolved, url=url, weight=max(1, weight), tags=tags or [])

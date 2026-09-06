@@ -16,6 +16,7 @@ import logging
 
 from curl_cffi import requests as cffi
 from curl_cffi.requests import AsyncSession
+from curl_cffi.requests.exceptions import SSLError
 from mitmproxy import http
 
 from .state import DIRECT_NAME, EgressRecord, ProfileStore, UpstreamPool
@@ -50,6 +51,24 @@ _DEFAULT_BLOCK_STATUS = {403, 429}
 # Hard ceiling on per-request failover attempts, regardless of pool size.
 _MAX_FAILOVER = 32
 
+# How many upstreams may return a TLS-trust failure before we stop and blame the target.
+# One is not enough: a single TLS-intercepting upstream in the pool would look identical to a
+# genuinely untrusted target. Two independent upstreams agreeing settles it — see the handler in
+# `_fetch_with_pool`.
+_MAX_TLS_VERDICTS = 2
+
+# Appended to the error surfaced for a TLS-trust failure. curl verifies against a roots-only
+# bundle and, unlike a browser, never chases the AuthorityInformationAccess URL to fetch a missing
+# intermediate — so a server that omits its intermediate works in Chrome and Burp but fails here
+# with "unable to get local issuer certificate". That asymmetry is confusing enough in the middle
+# of a test that the remedy belongs in the error itself rather than in the README.
+_TLS_TRUST_HINT = (
+    "the target's certificate chain did not verify on the upstream leg. Most often the server "
+    "omits its intermediate certificate — browsers hide this by fetching it via AIA, curl does "
+    "not — or it is signed by a private/internal CA. Pass --ca-bundle <pem> (certifi's cacert.pem "
+    "plus the missing intermediate/root) to keep verification on, or --insecure to skip it"
+)
+
 
 class ImpersonateUpstream:
     """Delegates the upstream leg of every proxied request to curl_cffi, via the pool."""
@@ -59,7 +78,9 @@ class ImpersonateUpstream:
         store: ProfileStore,
         pool: UpstreamPool,
         *,
-        verify_upstream: bool = True,
+        # True verifies against curl's default trust store, False disables verification, and a
+        # str is a path to a PEM bundle used instead (curl_cffi maps it onto CURLOPT_CAINFO).
+        verify_upstream: bool | str = True,
         allow_direct_fallback: bool = False,
         block_statuses: set[int] | None = None,
         connect_timeout: float = 8.0,
@@ -185,6 +206,11 @@ class ImpersonateUpstream:
         """
         tried: set[str] = set()
         last_exc: Exception | None = None
+        # TLS-trust failures are tracked apart from connection failures: they neither bench an
+        # upstream nor consume the full pool, and they are the more actionable thing to report
+        # when a request fails both ways (see the two `except` arms below).
+        tls_exc: Exception | None = None
+        tls_verdicts = 0
         # One attempt per upstream, plus one for the empty-pool/direct case, capped for safety.
         budget = min(_MAX_FAILOVER, self._pool.size() + 1)
 
@@ -200,14 +226,24 @@ class ImpersonateUpstream:
                 # pool (direct is intended), or --allow-direct-fallback. With a configured proxy
                 # pool, refuse direct so the client's real IP never leaks — surface the error.
                 if self._pool.has_proxy_upstreams() and not self._allow_direct_fallback:
+                    # A TLS verdict still outranks the generic exhaustion message: the pool can run
+                    # out after a single certificate failure (one upstream ruled out, the rest
+                    # unreachable), and "all upstreams failed (connection errors)" would then send
+                    # the operator hunting a proxy problem that isn't there.
+                    if tls_exc is not None:
+                        raise RuntimeError(f"{tls_exc} — {_TLS_TRUST_HINT}") from tls_exc
                     raise last_exc or RuntimeError(
                         "all upstream proxies failed this request (connection errors); "
                         "refusing direct egress to avoid leaking the real IP — check/add "
                         "upstreams, or pass --allow-direct-fallback to permit direct"
                     )
                 name, proxies = DIRECT_NAME, None
+                tls_hop = False
             else:
                 name, proxies = upstream.name, upstream.proxies()
+                # An https:// hop presents a certificate of its own, so a TLS failure through it
+                # is not unambiguously the target's fault (see Upstream.is_tls_proxy).
+                tls_hop = upstream.is_tls_proxy()
 
             try:
                 resp = await session.request(
@@ -241,6 +277,35 @@ class ImpersonateUpstream:
                     # is silently lost. A MITM proxy must not normalise the URI.
                     quote=False,
                 )
+            except SSLError as exc:  # curl 60/35/51…: a verdict about the TARGET, not this hop
+                # A TLS-trust failure says the target's certificate was unacceptable. That is not
+                # evidence this upstream is unhealthy, so it must NOT count towards the upstream's
+                # failure budget: benching a perfectly good proxy because one host serves a broken
+                # chain would poison the pool for every OTHER host that proxy serves — and with
+                # `unhealthy_until` being a property of the upstream rather than of the (host,
+                # upstream) pair, a handful of requests to one misconfigured host can bench the
+                # whole pool. The failure is also deterministic: the same chain fails identically
+                # through every upstream, so walking the remaining pool only multiplies the latency
+                # before the client sees the same error anyway.
+                #
+                # We still try a SECOND upstream, because a lone TLS-intercepting proxy in the pool
+                # is indistinguishable from an untrusted target on one sample. Two independent
+                # upstreams returning the same verdict settle it, and we fail fast.
+                #
+                # The one exception is an https:// upstream, which has a certificate of its own:
+                # there a TLS failure may genuinely be the hop's, so it keeps the ordinary
+                # bench-and-failover treatment rather than being blamed on the target.
+                if tls_hop:
+                    last_exc = exc
+                    self._pool.record_result(host, name, ok=False)
+                    tried.add(name)
+                    continue
+                tls_exc = exc
+                tls_verdicts += 1
+                tried.add(name)
+                if tls_verdicts >= _MAX_TLS_VERDICTS or name == DIRECT_NAME:
+                    break
+                continue
             except Exception as exc:  # noqa: BLE001 — connection error: bench + failover
                 last_exc = exc
                 self._pool.record_result(host, name, ok=False)
@@ -254,4 +319,10 @@ class ImpersonateUpstream:
             self._pool.record_result(host, name, ok=True, blocked=blocked)
             return resp, name
 
+        # A TLS-trust verdict outranks a connection error when both happened: the unreachable
+        # upstreams are a pool-hygiene problem the operator may already know about, whereas the
+        # certificate failure is the one that needs a flag change, and reporting whichever error
+        # merely came last would hide it behind an unrelated timeout.
+        if tls_exc is not None:
+            raise RuntimeError(f"{tls_exc} — {_TLS_TRUST_HINT}") from tls_exc
         raise last_exc if last_exc is not None else RuntimeError("no upstream available")
