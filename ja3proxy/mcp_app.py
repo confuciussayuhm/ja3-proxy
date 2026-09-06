@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from .state import FALLBACK_PROFILES, SCOPES, STRATEGIES, ProfileStore, UpstreamPool
 
@@ -43,7 +44,25 @@ def available_profiles() -> list[str]:
 
 
 def build_mcp(store: ProfileStore, pool: UpstreamPool) -> FastMCP:
-    mcp = FastMCP("ja3-proxy")
+    # The MCP SDK auto-enables DNS-rebinding protection whenever the server binds to a loopback
+    # address, and its default allow-list is 127.0.0.1 / localhost / [::1] only. The consumer here
+    # is a Docker container reaching the host as `host.docker.internal`, so with the defaults every
+    # connection is refused with "Invalid Host header" and the client sees a dead control plane -
+    # while the data plane on the proxy port keeps working, which makes it look healthy. Keep the
+    # protection on and admit the one hostname Docker uses.
+    mcp = FastMCP(
+        "ja3-proxy",
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*", "host.docker.internal:*"],
+            allowed_origins=[
+                "http://127.0.0.1:*",
+                "http://localhost:*",
+                "http://[::1]:*",
+                "http://host.docker.internal:*",
+            ],
+        ),
+    )
 
     # ---- impersonation ----------------------------------------------------------------
 
